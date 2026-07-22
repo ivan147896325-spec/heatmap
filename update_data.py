@@ -15,7 +15,7 @@ URL_SLOPE = "https://data.ardswc.gov.tw/api/v1/DebrisStream"
 
 def fetch_data(url, tag="", filter_recent_months=False, drop_dups=True, is_json=False):
     try:
-        print(f"[{tag}] 開始下載資料...")
+        print(f"\n==================== [{tag}] 開始下載資料 ====================")
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
         session = requests.Session()
         res = session.get(url, headers=headers, timeout=60, verify=False, allow_redirects=True)
@@ -24,52 +24,74 @@ def fetch_data(url, tag="", filter_recent_months=False, drop_dups=True, is_json=
         df = None
 
         if is_json:
+            print(f"[{tag}] 正在解析 JSON 資料...")
             data = res.json()
             if isinstance(data, dict) and 'data' in data:
                 df = pd.DataFrame(data['data'])
             elif isinstance(data, list):
                 df = pd.DataFrame(data)
+            print(f"[{tag}] JSON 載入完成，取得 {len(df) if df is not None else 0} 筆列資料")
         else:
             content = res.content
+            print(f"[{tag}] 下載完成，內容大小: {len(content) / 1024:.1f} KB")
 
-            # Zip 檔解壓處理 (參考 Kiang 邏輯：明確排除 meta 雜訊檔與目錄)
+            # Zip 檔解壓處理
             if content[:4] == b'PK\x03\x04':
-                print(f"[{tag}] 進行 ZIP 解壓...")
+                print(f"[{tag}] 偵測到 ZIP 格式，開始掃描內部檔案結構...")
                 meta_files = ['file.csv', 'manifest.csv', 'schema-file.csv']
                 with zipfile.ZipFile(io.BytesIO(content)) as z:
                     dfs = []
-                    for info in z.infolist():
-                        # 1. 徹底排除目錄 (避免把資料夾路徑拿去 read_csv)
-                        if info.is_dir():
-                            continue
-                        
+                    all_infos = z.infolist()
+                    print(f"[{tag}] ZIP 內共有 {len(all_infos)} 個項目 (含目錄與檔案):")
+
+                    for idx, info in enumerate(all_infos, 1):
                         filename_only = info.filename.split('/')[-1].lower()
+                        is_dir_flag = info.is_dir()
                         
-                        # 2. 排除黑名單 (file.csv, manifest.csv, schema-file.csv) 並鎖定 .csv 檔
-                        if filename_only.endswith('.csv') and filename_only not in meta_files and info.file_size > 10 * 1024:
-                            try:
-                                print(f"[{tag}] 讀取主資料檔: {info.filename} ({info.file_size / 1024:.1f} KB)")
-                                temp_df = pd.read_csv(z.open(info.filename), on_bad_lines='skip', encoding='utf-8-sig', dtype=str)
-                                if len(temp_df) > 0:
-                                    dfs.append(temp_df)
-                            except Exception as parse_err:
-                                print(f"[{tag}] ⚠️ 跳過異常子檔案 {info.filename}: {parse_err}")
+                        # Print 每個項目的詳細特徵
+                        print(f"  [{idx}/{len(all_infos)}] 項目: '{info.filename}' | 目錄?: {is_dir_flag} | 大小: {info.file_size} Bytes")
+
+                        # 判斷是否為黑名單或無效項目
+                        if is_dir_flag:
+                            print(f"    └─ ❌ 跳過: 此項目為目錄/資料夾")
+                            continue
+                        if filename_only in meta_files:
+                            print(f"    └─ ❌ 跳過: 命中 metadata 黑名單 ({filename_only})")
+                            continue
+                        if not filename_only.endswith('.csv'):
+                            print(f"    └─ ❌ 跳過: 非 .csv 檔案")
+                            continue
+                        if info.file_size < 1000:  # 小於 1KB 視為無效檔
+                            print(f"    └─ ❌ 跳過: 容量過小 (< 1KB)")
+                            continue
+
+                        # 嘗試讀取目標 CSV
+                        try:
+                            print(f"    └─ 🟢 嘗試讀取 CSV 內容: {info.filename}...")
+                            temp_df = pd.read_csv(z.open(info.filename), on_bad_lines='skip', encoding='utf-8-sig', dtype=str)
+                            print(f"       成功讀取! 欄位清單: {list(temp_df.columns)} | 資料列數: {len(temp_df)}")
+                            if len(temp_df) > 0:
+                                dfs.append(temp_df)
+                        except Exception as parse_err:
+                            print(f"    └─ ⚠️ 讀取失敗 報錯內容: {parse_err}")
 
                     if dfs:
                         df = pd.concat(dfs, ignore_index=True)
-                        print(f"[{tag}] 成功併檔 {len(dfs)} 個有效資料集，總計 {len(df)} 筆原始資料")
+                        print(f"[{tag}] 成功併檔 {len(dfs)} 個有效資料集，總計 {len(df)} 筆原始列資料")
 
             # Gzip 檔解壓
             if df is None and content[:2] == b'\x1f\x8b':
+                print(f"[{tag}] 偵測到 GZIP 格式，開始解壓...")
                 with gzip.GzipFile(fileobj=io.BytesIO(content)) as gz:
                     df = pd.read_csv(gz, on_bad_lines='skip', encoding='utf-8-sig', dtype=str)
 
             # 一般 CSV 讀取
             if df is None:
+                print(f"[{tag}] 嘗試作為單一 CSV 檔讀取...")
                 df = pd.read_csv(io.BytesIO(content), on_bad_lines='skip', encoding='utf-8-sig', dtype=str)
 
         if df is None or len(df) == 0:
-            print(f"[{tag}] ⚠️ 資料讀取為空")
+            print(f"[{tag}] ⚠️ 最終 DataFrame 為空")
             return None
 
         # 精準鎖定欄位名稱
@@ -85,7 +107,7 @@ def fetch_data(url, tag="", filter_recent_months=False, drop_dups=True, is_json=
         print(f"[{tag}] 欄位對應 -> 緯度: [{lat_col}], 經度: [{lng_col}], 日期: [{date_col}]")
 
         if not lat_col or not lng_col:
-            print(f"[{tag}] ❌ 找不到經緯度欄位")
+            print(f"[{tag}] ❌ 找不到經緯度欄位！無法繪圖")
             return None
 
         # --- 時間過濾 ---
@@ -104,10 +126,11 @@ def fetch_data(url, tag="", filter_recent_months=False, drop_dups=True, is_json=
 
             df['parsed_dt'] = df[date_col].apply(parse_8digit_date)
             valid_cnt = df['parsed_dt'].notnull().sum()
+            print(f"[{tag}] 日期欄位成功解析比例: {valid_cnt} / {len(df)} 筆")
 
             if valid_cnt > 0:
                 df = df[df['parsed_dt'] >= cutoff_date]
-                print(f"[{tag}] 進行 90 天時間篩選，剩餘 {len(df)} 筆")
+                print(f"[{tag}] 進行 90 天時間篩選 ({cutoff_date.strftime('%Y-%m-%d')} 至今)，剩餘 {len(df)} 筆")
         else:
             print(f"[{tag}] 🔒 不進行時間篩選，保留全量資料")
 
@@ -128,7 +151,7 @@ def fetch_data(url, tag="", filter_recent_months=False, drop_dups=True, is_json=
         return df_clean[[lat_col, lng_col]].values.tolist()
 
     except Exception as e:
-        print(f"[{tag}] ❌ 處理失敗: {e}")
+        print(f"[{tag}] ❌ 處理發生嚴重例外失敗: {e}")
         return None
 
 # --- 地圖初始化 ---
@@ -141,14 +164,14 @@ if pts_a1:
     HeatMap(pts_a1, radius=15, blur=10).add_to(fg1)
     fg1.add_to(m)
 
-# 2. A2 事故 (近3個月，徹底排除目錄與 meta 檔)
+# 2. A2 事故 (近3個月，加強偵錯輸出的解壓邏輯)
 pts_a2 = fetch_data(URL_A2, "A2事故", filter_recent_months=True, drop_dups=True)
 if pts_a2:
     fg2 = folium.FeatureGroup(name="⚠️ A2 類交通事故 (近3個月)", show=False)
     HeatMap(pts_a2, radius=10, blur=8, gradient={0.4: 'cyan', 0.65: 'yellow', 1: 'orange'}).add_to(fg2)
     fg2.add_to(m)
 
-# 3. 山坡地警戒點 (修正為水保署開放資料 API 端點)
+# 3. 山坡地警戒點
 pts_slope = fetch_data(URL_SLOPE, "山坡地警戒", filter_recent_months=False, drop_dups=True, is_json=True)
 if pts_slope:
     fg3 = folium.FeatureGroup(name="⛰️ 土石流及坡地災害警戒區", show=False)
@@ -217,4 +240,4 @@ m.get_root().html.add_child(folium.Element(real_geo_js))
 folium.LayerControl(collapsed=False).add_to(m)
 
 m.save("index.html")
-print("更新完成！")
+print("\n==================== 全部處理完畢！已產出 index.html ====================")
