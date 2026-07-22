@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 # 1. 官方 API 網址
 URL_A1 = "https://opdadm.moi.gov.tw/api/v1/no-auth/resource/api/dataset/02D40248-7CAA-4354-82EA-E27AB8DCAB39/resource/7CE45778-7EF7-4B45-BD69-7BFB6868C0DB/download"
 URL_A2 = "https://opdadm.moi.gov.tw/api/v1/no-auth/resource/api/dataset/266D0D60-4966-4F2A-A80F-A8659ED511E9/resource/7743EB5B-6A59-4785-B4BA-6D29DEDF82CD/download"
-# 最新山坡地/土石流警戒 API 網址
+# 最新水保署 API 網址
 URL_SLOPE = "https://data.ardswc.gov.tw/api/v1/DebrisWarning"
 
 def fetch_data(url, tag="", filter_recent_months=False, is_json=False):
@@ -29,26 +29,24 @@ def fetch_data(url, tag="", filter_recent_months=False, is_json=False):
         else:
             content = res.content
 
-            # Zip 檔解壓處理：逐一安全讀取 >10KB 的所有 CSV 檔並併檔
+            # Zip 檔解壓處理
             if content[:4] == b'PK\x03\x04':
                 print(f"[{tag}] 進行 ZIP 解壓...")
                 with zipfile.ZipFile(io.BytesIO(content)) as z:
                     dfs = []
                     for info in z.infolist():
-                        # 過濾說明檔與過小檔案 (> 10 KB)
-                        if info.filename.lower().endswith('.csv') and info.file_size > 10 * 1024:
+                        # 排除資料夾，只讀取 .csv 檔案
+                        if not info.is_dir() and info.filename.lower().endswith('.csv'):
                             try:
-                                print(f"[{tag}] 正在解析 CSV: {info.filename} ({info.file_size / 1024:.1f} KB)")
                                 temp_df = pd.read_csv(z.open(info.filename), on_bad_lines='skip', encoding='utf-8-sig', dtype=str)
-                                # 確定含有座標相關欄位才加入
-                                if len(temp_df) > 0 and any(k in str(c) for c in temp_df.columns for k in ['緯', 'lat', 'y']):
+                                if len(temp_df) > 0:
                                     dfs.append(temp_df)
                             except Exception as parse_err:
                                 print(f"[{tag}] ⚠️ 跳過無效子檔案 {info.filename}: {parse_err}")
 
                     if dfs:
                         df = pd.concat(dfs, ignore_index=True)
-                        print(f"[{tag}] 成功併檔 {len(dfs)} 個有效資料集，總計 {len(df)} 筆資料")
+                        print(f"[{tag}] 成功併檔 {len(dfs)} 個有效資料集，總計 {len(df)} 筆原始資料")
 
             # Gzip 檔解壓
             if df is None and content[:2] == b'\x1f\x8b':
@@ -79,8 +77,8 @@ def fetch_data(url, tag="", filter_recent_months=False, is_json=False):
             print(f"[{tag}] ❌ 找不到經緯度欄位")
             return None
 
-        # --- 時間過濾 (filter_recent_months=True 時才執行) ---
-        if filter_recent_months and date_col:
+        # --- 時間過濾 (只有在明確指定 filter_recent_months=True 時才執行) ---
+        if filter_recent_months is True and date_col is not None:
             now = datetime.now()
             cutoff_date = now - timedelta(days=90)
             
@@ -95,11 +93,12 @@ def fetch_data(url, tag="", filter_recent_months=False, is_json=False):
 
             df['parsed_dt'] = df[date_col].apply(parse_8digit_date)
             valid_cnt = df['parsed_dt'].notnull().sum()
-            print(f"[{tag}] 日期成功解析: {valid_cnt} / {len(df)} 筆")
 
             if valid_cnt > 0:
                 df = df[df['parsed_dt'] >= cutoff_date]
-                print(f"[{tag}] 篩選 {cutoff_date.strftime('%Y-%m-%d')} 至今，剩餘 {len(df)} 筆")
+                print(f"[{tag}] 進行 90 天時間篩選，剩餘 {len(df)} 筆")
+        else:
+            print(f"[{tag}] 🔒 不進行時間篩選，保留全量資料")
 
         # 轉數字與座標區域清潔
         df[lat_col] = pd.to_numeric(df[lat_col], errors='coerce')
@@ -122,14 +121,14 @@ def fetch_data(url, tag="", filter_recent_months=False, is_json=False):
 # --- 地圖初始化 ---
 m = folium.Map(location=[23.973877, 120.982024], zoom_start=8, tiles="cartodbpositron", control_scale=True)
 
-# 1. A1 事故 (關鍵修改：全抓，不進行 3 個月時間篩選)
+# 1. A1 事故 (全抓，絕對不篩選時間)
 pts_a1 = fetch_data(URL_A1, "A1事故", filter_recent_months=False)
 if pts_a1:
     fg1 = folium.FeatureGroup(name="🚨 A1 類重大交通事故 (全歷史資料)", show=True)
     HeatMap(pts_a1, radius=15, blur=10).add_to(fg1)
     fg1.add_to(m)
 
-# 2. A2 事故 (多檔安全解析併檔 + 篩選近3個月)
+# 2. A2 事故 (近3個月)
 pts_a2 = fetch_data(URL_A2, "A2事故", filter_recent_months=True)
 if pts_a2:
     fg2 = folium.FeatureGroup(name="⚠️ A2 類交通事故 (近3個月)", show=False)
@@ -205,4 +204,4 @@ m.get_root().html.add_child(folium.Element(real_geo_js))
 folium.LayerControl(collapsed=False).add_to(m)
 
 m.save("index.html")
-print("更新完成！A1 為全量不篩選，A2 為多檔相容解析，山坡地 API 已更正！")
+print("更新完成！A1 完全鎖定不篩選，點位即將全部繪製！")
