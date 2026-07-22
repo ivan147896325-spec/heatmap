@@ -1,7 +1,9 @@
 import pandas as pd
 import folium
 from folium.plugins import HeatMap
-from datetime import datetime, timedelta
+import requests
+import io
+import zipfile
 
 # 1. 官方 API 網址設定
 URL_A1 = "https://opdadm.moi.gov.tw/api/v1/no-auth/resource/api/dataset/02D40248-7CAA-4354-82EA-E27AB8DCAB39/resource/7CE45778-7EF7-4B45-BD69-7BFB6868C0DB/download"
@@ -9,134 +11,121 @@ URL_A2 = "https://opdadm.moi.gov.tw/api/v1/no-auth/resource/api/dataset/266D0D60
 URL_SLOPE = "https://data.ardwc.gov.tw/dataset/d883b28b-b83b-4809-a75e-a6167ec50bc5/resource/46487e41-0f81-42cb-bc28-9d4cb058e11a/download/debris.csv"
 
 
-def process_data(url, name_tag="資料", filter_recent_months=True):
+def fetch_data(url, tag=""):
     try:
-        print(f"正在抓取 [{name_tag}]...")
-        df = pd.read_csv(url, on_bad_lines='skip', encoding='utf-8-sig', low_memory=False)
-        
-        lat_col = next((c for c in df.columns if '緯' in c or 'lat' in c.lower()), None)
-        lng_col = next((c for c in df.columns if '經' in c or 'lng' in c.lower() or 'lon' in c.lower()), None)
-        
+        print(f"[{tag}] 開始下載資料...")
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        response = requests.get(url, headers=headers, timeout=60)
+        response.raise_for_status()
+
+        # 自動判斷並解壓縮 ZIP 檔 (針對 A2 大資料包)
+        if response.content[:4] == b'PK\x03\x04':
+            print(f"[{tag}] 偵測到 ZIP 壓縮檔，自動解壓中...")
+            with zipfile.ZipFile(io.BytesIO(response.content)) as z:
+                csv_name = next(f for f in z.namelist() if f.endswith('.csv'))
+                df = pd.read_csv(z.open(csv_name), on_bad_lines='skip', encoding='utf-8-sig', low_memory=False)
+        else:
+            df = pd.read_csv(io.BytesIO(response.content), on_bad_lines='skip', encoding='utf-8-sig', low_memory=False)
+
+        print(f"[{tag}] 成功讀取 {len(df)} 筆原始資料")
+
+        # 自動尋找經緯度欄位
+        lat_col = next((c for c in df.columns if any(k in c.lower() for k in ['緯', 'lat', 'y'])), None)
+        lng_col = next((c for c in df.columns if any(k in c.lower() for k in ['經', 'lng', 'lon', 'x'])), None)
+
         if not lat_col or not lng_col:
-            print(f"[{name_tag}] ⚠️ 未找到經緯度欄位")
+            print(f"[{tag}] ⚠️ 未找到經緯度欄位: {list(df.columns)[:5]}")
             return None
-            
+
         df[lat_col] = pd.to_numeric(df[lat_col], errors='coerce')
         df[lng_col] = pd.to_numeric(df[lng_col], errors='coerce')
-        
-        df_clean = df.dropna(subset=[lat_col, lng_col]).copy()
+
+        df_clean = df.dropna(subset=[lat_col, lng_col])
         df_clean = df_clean[(df_clean[lat_col] > 21) & (df_clean[lat_col] < 26) & 
                             (df_clean[lng_col] > 119) & (df_clean[lng_col] < 123)]
-        
-        if filter_recent_months:
-            date_col = next((c for c in df.columns if '日期' in c or 'date' in c.lower()), None)
-            if date_col:
-                def parse_taiwan_date(d):
-                    try:
-                        s = str(int(float(d)))
-                        if len(s) == 7:
-                            return datetime(int(s[:3]) + 1911, int(s[3:5]), int(s[5:7]))
-                        elif len(s) == 8:
-                            return datetime.strptime(s, "%Y%m%d")
-                    except:
-                        return None
-                    return None
 
-                df_clean['parsed_date'] = df_clean[date_col].apply(parse_taiwan_date)
-                max_date = df_clean['parsed_date'].max()
-                
-                if pd.notnull(max_date):
-                    cutoff_date = max_date - timedelta(days=90)
-                    df_filtered = df_clean[df_clean['parsed_date'] >= cutoff_date]
-                    if not df_filtered.empty:
-                        df_clean = df_filtered
-        
-        print(f"[{name_tag}] 成功處理：{len(df_clean)} 筆")
+        print(f"[{tag}] 解析完成，有效點數：{len(df_clean)}")
         return [[row[lat_col], row[lng_col]] for _, row in df_clean.iterrows()]
 
     except Exception as e:
-        print(f"[{name_tag}] 處理失敗: {e}")
+        print(f"[{tag}] ❌ 讀取失敗: {e}")
         return None
 
 
-# --- 開始建立地圖 ---
-center_loc = [23.973877, 120.982024]
-m = folium.Map(
-    location=center_loc, 
-    zoom_start=8, 
-    tiles="cartodbpositron",
-    control_scale=True
-)
+# --- 2. 建立地圖 ---
+m = folium.Map(location=[23.973877, 120.982024], zoom_start=8, tiles="cartodbpositron", control_scale=True)
 
-# 1. A1 事故圖層
-heat_a1 = process_data(URL_A1, name_tag="A1事故", filter_recent_months=True)
-if heat_a1:
-    fg_a1 = folium.FeatureGroup(name="🚨 A1 類重大交通事故 (最新3個月)", show=True)
-    HeatMap(heat_a1, radius=15, blur=10, gradient={0.4: 'blue', 0.65: 'lime', 1: 'red'}).add_to(fg_a1)
-    fg_a1.add_to(m)
+# A1 重大事故
+pts_a1 = fetch_data(URL_A1, "A1事故")
+if pts_a1:
+    fg1 = folium.FeatureGroup(name="🚨 A1 類重大交通事故 (死亡)", show=True)
+    HeatMap(pts_a1, radius=15, blur=10).add_to(fg1)
+    fg1.add_to(m)
 
-# 2. A2 事故圖層
-heat_a2 = process_data(URL_A2, name_tag="A2事故", filter_recent_months=True)
-if heat_a2:
-    fg_a2 = folium.FeatureGroup(name="⚠️ A2 類交通事故 (最新3個月)", show=False)
-    HeatMap(heat_a2, radius=10, blur=8, gradient={0.4: 'cyan', 0.65: 'yellow', 1: 'orange'}).add_to(fg_a2)
-    fg_a2.add_to(m)
+# A2 交通事故 (自動解壓)
+pts_a2 = fetch_data(URL_A2, "A2事故")
+if pts_a2:
+    fg2 = folium.FeatureGroup(name="⚠️ A2 類交通事故 (受傷)", show=False)
+    HeatMap(pts_a2, radius=10, blur=8, gradient={0.4: 'cyan', 0.65: 'yellow', 1: 'orange'}).add_to(fg2)
+    fg2.add_to(m)
 
-# 3. 山坡地警戒圖層
-heat_slope = process_data(URL_SLOPE, name_tag="山坡地警戒", filter_recent_months=False)
-if heat_slope:
-    fg_slope = folium.FeatureGroup(name="⛰️ 土石流/山坡地警戒點", show=False)
-    HeatMap(heat_slope, radius=18, blur=12, gradient={0.4: 'purple', 0.8: 'brown', 1: 'darkred'}).add_to(fg_slope)
-    fg_slope.add_to(m)
+# 山坡地警戒點
+pts_slope = fetch_data(URL_SLOPE, "山坡地警戒")
+if pts_slope:
+    fg3 = folium.FeatureGroup(name="⛰️ 土石流及坡地災害警戒點", show=False)
+    HeatMap(pts_slope, radius=18, blur=12, gradient={0.4: 'purple', 0.8: 'brown', 1: 'darkred'}).add_to(fg3)
+    fg3.add_to(m)
 
-# 4. 畫面中央 1km / 2km / 3km 固定範圍圈圖層 (預設隱藏，可由右上角開啟)
-fg_center_circles = folium.FeatureGroup(name="🎯 畫面中央 1~3km 固定範圍圈", show=False)
-fg_center_circles.add_to(m)
+# --- 3. 畫面中央 1~3km 動態範圍圈圖層 ---
+fg_circles = folium.FeatureGroup(name="🎯 畫面中央 1~3km 固定範圍圈", show=False)
+fg_circles.add_to(m)
 
-# 注入動態追蹤畫面中央點的 JavaScript
+# 安全注入綁定 Leaflet 實體的 JavaScript
 center_js = """
 <script>
-document.addEventListener('DOMContentLoaded', function() {
-    var c1 = L.circle(map.getCenter(), {radius: 1000, color: 'red', weight: 2, fill: true, fillOpacity: 0.08, interactive: false});
-    var c2 = L.circle(map.getCenter(), {radius: 2000, color: 'blue', weight: 1.5, fill: false, interactive: false});
-    var c3 = L.circle(map.getCenter(), {radius: 3000, color: 'green', weight: 1.2, fill: false, interactive: false});
-    
-    // 中央小十字標記
-    var crosshair = L.circleMarker(map.getCenter(), {radius: 4, color: 'black', fillColor: 'red', fillOpacity: 1, interactive: false});
-
-    // 取得圖層物件綁定
-    var circleGroup = null;
-    map.eachLayer(function(layer) {
-        if (layer.options && layer.options.name && layer.options.name.includes("畫面中央")) {
-            circleGroup = layer;
+window.addEventListener('load', function() {
+    // 自動取得 Folium 產生的地圖變數
+    var mapObj = None;
+    for (var key in window) {
+        if (key.startsWith('map_') && window[key] instanceof L.Map) {
+            mapObj = window[key];
+            break;
         }
-    });
-
-    if (circleGroup) {
-        circleGroup.addLayer(c1);
-        circleGroup.addLayer(c2);
-        circleGroup.addLayer(c3);
-        circleGroup.addLayer(crosshair);
     }
+    
+    if (!mapObj) return;
 
-    // 地圖平移或縮放時，同步更新圓心位置
-    function updateCenterCircles() {
-        var center = map.getCenter();
+    // 尋找中央圖層 FeatureGroup
+    var circleGroup = L.layerGroup().addTo(mapObj);
+    
+    var c1 = L.circle(mapObj.getCenter(), {radius: 1000, color: 'red', weight: 2, fill: true, fillOpacity: 0.08, interactive: false});
+    var c2 = L.circle(mapObj.getCenter(), {radius: 2000, color: 'blue', weight: 1.5, fill: false, interactive: false});
+    var c3 = L.circle(mapObj.getCenter(), {radius: 3000, color: 'green', weight: 1.2, fill: false, interactive: false});
+    var crosshair = L.circleMarker(mapObj.getCenter(), {radius: 4, color: 'black', fillColor: 'red', fillOpacity: 1, interactive: false});
+
+    circleGroup.addLayer(c1);
+    circleGroup.addLayer(c2);
+    circleGroup.addLayer(c3);
+    circleGroup.addLayer(crosshair);
+
+    function updateCenter() {
+        var center = mapObj.getCenter();
         c1.setLatLng(center);
         c2.setLatLng(center);
         c3.setLatLng(center);
         crosshair.setLatLng(center);
     }
 
-    map.on('move', updateCenterCircles);
+    mapObj.on('move', updateCenter);
+    mapObj.on('zoomend', updateCenter);
 });
 </script>
 """
 m.get_root().html.add_child(folium.Element(center_js))
 
-# 右上角開關選單
+# 選單控制
 folium.LayerControl(collapsed=False).add_to(m)
 
-# 儲存
+# 儲存網頁
 m.save("index.html")
-print("成功生成畫面中央固定 1~3km 範圍圈圖層！")
+print("地圖與圓圈修復完成！")
