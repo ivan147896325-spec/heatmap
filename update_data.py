@@ -10,42 +10,75 @@ from datetime import datetime, timedelta
 # 1. 官方 API 網址
 URL_A1 = "https://opdadm.moi.gov.tw/api/v1/no-auth/resource/api/dataset/02D40248-7CAA-4354-82EA-E27AB8DCAB39/resource/7CE45778-7EF7-4B45-BD69-7BFB6868C0DB/download"
 URL_A2 = "https://opdadm.moi.gov.tw/api/v1/no-auth/resource/api/dataset/266D0D60-4966-4F2A-A80F-A8659ED511E9/resource/7743EB5B-6A59-4785-B4BA-6D29DEDF82CD/download"
-URL_SLOPE = "https://data.moi.gov.tw/MoiOD/System/DownloadFile.aspx?DATA=B75BA704-B091-4D2A-B980-EB141C44F35E"
+URL_SLOPE = "https://data.ardswc.gov.tw/api/v1/DebrisWarning"
 
-def fetch_data(url, tag="", filter_recent_months=False):
+def fetch_data(url, tag="", filter_recent_months=False, is_json=False):
     try:
         print(f"[{tag}] 開始下載資料...")
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-        res = requests.get(url, headers=headers, timeout=60, verify=False)
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': '*/*',
+            'Connection': 'keep-alive'
+        }
+        
+        session = requests.Session()
+        res = session.get(url, headers=headers, timeout=60, verify=False, allow_redirects=True)
         res.raise_for_status()
 
-        content = res.content
         df = None
 
-        # 1. Zip 檔解壓
-        if content[:4] == b'PK\x03\x04':
-            print(f"[{tag}] 進行 ZIP 解壓...")
-            with zipfile.ZipFile(io.BytesIO(content)) as z:
-                csv_files = [f for f in z.namelist() if f.endswith('.csv')]
-                if csv_files:
-                    df = pd.read_csv(z.open(csv_files[0]), on_bad_lines='skip', encoding='utf-8-sig', low_memory=False)
+        if is_json:
+            data = res.json()
+            if isinstance(data, dict) and 'data' in data:
+                df = pd.DataFrame(data['data'])
+            else:
+                df = pd.DataFrame(data)
+        else:
+            content = res.content
+            # 1. Zip 檔解壓 (瞄準 NPA 開頭的所有主檔並合併)
+            if content[:4] == b'PK\x03\x04':
+                print(f"[{tag}] 進行 ZIP 解壓...")
+                with zipfile.ZipFile(io.BytesIO(content)) as z:
+                    # 抓出所有 NPA 開頭且為 CSV 的檔案
+                    npa_files = [f for f in z.namelist() if f.upper().startswith('NPA') and f.lower().endswith('.csv')]
+                    
+                    if npa_files:
+                        dfs = []
+                        for file_name in npa_files:
+                            print(f"[{tag}] 讀取主檔案: {file_name}")
+                            temp_df = pd.read_csv(z.open(file_name), on_bad_lines='skip', encoding='utf-8-sig', low_memory=False)
+                            dfs.append(temp_df)
+                        
+                        # 全部 NPA 檔案合併
+                        df = pd.concat(dfs, ignore_index=True)
+                        print(f"[{tag}] 已成功合併 {len(npa_files)} 個 NPA 資料檔")
+                    else:
+                        # 備案：萬一沒有 NPA 前綴，避開小檔案（容量 > 100KB 的檔）
+                        main_files = [f for f in z.namelist() if f.lower().endswith('.csv') and z.getinfo(f).file_size > 100 * 1024]
+                        if main_files:
+                            dfs = [pd.read_csv(z.open(f), on_bad_lines='skip', encoding='utf-8-sig', low_memory=False) for f in main_files]
+                            df = pd.concat(dfs, ignore_index=True)
 
-        # 2. Gzip 檔解壓
-        if df is None and content[:2] == b'\x1f\x8b':
-            print(f"[{tag}] 進行 GZIP 解壓...")
-            with gzip.GzipFile(fileobj=io.BytesIO(content)) as gz:
-                df = pd.read_csv(gz, on_bad_lines='skip', encoding='utf-8-sig', low_memory=False)
+            # 2. Gzip 檔解壓
+            if df is None and content[:2] == b'\x1f\x8b':
+                print(f"[{tag}] 進行 GZIP 解壓...")
+                with gzip.GzipFile(fileobj=io.BytesIO(content)) as gz:
+                    df = pd.read_csv(gz, on_bad_lines='skip', encoding='utf-8-sig', low_memory=False)
 
-        # 3. 一般 CSV 讀取
-        if df is None:
-            df = pd.read_csv(io.BytesIO(content), on_bad_lines='skip', encoding='utf-8-sig', low_memory=False)
+            # 3. 一般 CSV 讀取
+            if df is None:
+                df = pd.read_csv(io.BytesIO(content), on_bad_lines='skip', encoding='utf-8-sig', low_memory=False)
 
-        print(f"[{tag}] 成功讀取 {len(df)} 筆原始資料")
+        if df is None or len(df) == 0:
+            print(f"[{tag}] ⚠️ 無法解析內容或資料為空")
+            return None
+
+        print(f"[{tag}] 成功讀取總計 {len(df)} 筆原始資料")
 
         # 自動尋找經緯度與日期欄位
-        lat_col = next((c for c in df.columns if any(k in c.lower() for k in ['緯', 'lat', 'y'])), None)
-        lng_col = next((c for c in df.columns if any(k in c.lower() for k in ['經', 'lng', 'lon', 'x'])), None)
-        date_col = next((c for c in df.columns if any(k in c.lower() for k in ['日', 'date', '時間'])), None)
+        lat_col = next((c for c in df.columns if any(k in str(c).lower() for k in ['緯', 'lat', 'y', 'latitude'])), None)
+        lng_col = next((c for c in df.columns if any(k in str(c).lower() for k in ['經', 'lng', 'lon', 'x', 'longitude'])), None)
+        date_col = next((c for c in df.columns if any(k in str(c).lower() for k in ['日', 'date', '時間'])), None)
 
         if not lat_col or not lng_col:
             print(f"[{tag}] ⚠️ 未找到經緯度欄位")
@@ -55,7 +88,7 @@ def fetch_data(url, tag="", filter_recent_months=False):
         if filter_recent_months and date_col:
             now = datetime.now()
             cutoff_date = now - timedelta(days=90)
-            print(f"[{tag}] 執行現實時間比對，基準點：{now.strftime('%Y-%m-%d')}，過濾 {cutoff_date.strftime('%Y-%m-%d')} 至今資料...")
+            print(f"[{tag}] 執行時間比對，基準點：{now.strftime('%Y-%m-%d')}，過濾 {cutoff_date.strftime('%Y-%m-%d')} 至今資料...")
 
             def parse_date(val):
                 try:
@@ -99,7 +132,7 @@ if pts_a1:
     HeatMap(pts_a1, radius=15, blur=10).add_to(fg1)
     fg1.add_to(m)
 
-# 2. A2 事故 (近3個月，自動解壓)
+# 2. A2 事故 (近3個月，全數抓取 NPA 開頭主檔並合併)
 pts_a2 = fetch_data(URL_A2, "A2事故", filter_recent_months=True)
 if pts_a2:
     fg2 = folium.FeatureGroup(name="⚠️ A2 類交通事故 (近3個月)", show=False)
@@ -107,7 +140,7 @@ if pts_a2:
     fg2.add_to(m)
 
 # 3. 山坡地警戒點
-pts_slope = fetch_data(URL_SLOPE, "山坡地警戒", filter_recent_months=False)
+pts_slope = fetch_data(URL_SLOPE, "山坡地警戒", filter_recent_months=False, is_json=True)
 if pts_slope:
     fg3 = folium.FeatureGroup(name="⛰️ 土石流及坡地災害警戒區", show=False)
     HeatMap(pts_slope, radius=18, blur=12, gradient={0.4: 'purple', 0.8: 'brown', 1: 'darkred'}).add_to(fg3)
@@ -175,4 +208,4 @@ m.get_root().html.add_child(folium.Element(real_geo_js))
 folium.LayerControl(collapsed=False).add_to(m)
 
 m.save("index.html")
-print("地圖與近3個月資料計算更新完成！")
+print("更新完成！現在會將所有 NPA 開頭的事故 CSV 全部合併處理！")
