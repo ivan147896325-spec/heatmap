@@ -10,10 +10,10 @@ from datetime import datetime, timedelta
 # 1. 官方 API 網址
 URL_A1 = "https://opdadm.moi.gov.tw/api/v1/no-auth/resource/api/dataset/02D40248-7CAA-4354-82EA-E27AB8DCAB39/resource/7CE45778-7EF7-4B45-BD69-7BFB6868C0DB/download"
 URL_A2 = "https://opdadm.moi.gov.tw/api/v1/no-auth/resource/api/dataset/266D0D60-4966-4F2A-A80F-A8659ED511E9/resource/7743EB5B-6A59-4785-B4BA-6D29DEDF82CD/download"
-# 最新水保署 API 網址
+# 最新水保署 API 正確網址
 URL_SLOPE = "https://data.ardswc.gov.tw/api/v1/DebrisWarning"
 
-def fetch_data(url, tag="", filter_recent_months=False, is_json=False):
+def fetch_data(url, tag="", filter_recent_months=False, drop_dups=True, is_json=False):
     try:
         print(f"[{tag}] 開始下載資料...")
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
@@ -35,11 +35,12 @@ def fetch_data(url, tag="", filter_recent_months=False, is_json=False):
                 with zipfile.ZipFile(io.BytesIO(content)) as z:
                     dfs = []
                     for info in z.infolist():
-                        # 排除資料夾，只讀取 .csv 檔案
-                        if not info.is_dir() and info.filename.lower().endswith('.csv'):
+                        # 關鍵防護 1：排除資料夾，只讀取實體 .csv 檔
+                        if not info.is_dir() and info.filename.lower().endswith('.csv') and info.file_size > 10 * 1024:
                             try:
+                                print(f"[{tag}] 讀取 CSV: {info.filename} ({info.file_size / 1024:.1f} KB)")
                                 temp_df = pd.read_csv(z.open(info.filename), on_bad_lines='skip', encoding='utf-8-sig', dtype=str)
-                                if len(temp_df) > 0:
+                                if len(temp_df) > 0 and any(k in str(c) for c in temp_df.columns for k in ['緯', 'lat', 'y']):
                                     dfs.append(temp_df)
                             except Exception as parse_err:
                                 print(f"[{tag}] ⚠️ 跳過無效子檔案 {info.filename}: {parse_err}")
@@ -66,7 +67,6 @@ def fetch_data(url, tag="", filter_recent_months=False, is_json=False):
         lng_col = next((c for c in df.columns if str(c).strip() == '經度'), None)
         date_col = next((c for c in df.columns if str(c).strip() == '發生日期'), None)
 
-        # 備援模糊搜尋
         if not lat_col: lat_col = next((c for c in df.columns if '緯' in str(c)), None)
         if not lng_col: lng_col = next((c for c in df.columns if '經' in str(c)), None)
         if not date_col: date_col = next((c for c in df.columns if '日' in str(c)), None)
@@ -77,7 +77,7 @@ def fetch_data(url, tag="", filter_recent_months=False, is_json=False):
             print(f"[{tag}] ❌ 找不到經緯度欄位")
             return None
 
-        # --- 時間過濾 (只有在明確指定 filter_recent_months=True 時才執行) ---
+        # --- 時間過濾 ---
         if filter_recent_months is True and date_col is not None:
             now = datetime.now()
             cutoff_date = now - timedelta(days=90)
@@ -108,10 +108,13 @@ def fetch_data(url, tag="", filter_recent_months=False, is_json=False):
         df_clean = df_clean[(df_clean[lat_col] > 21) & (df_clean[lat_col] < 26) & 
                             (df_clean[lng_col] > 119) & (df_clean[lng_col] < 123)]
 
-        # 移除重複點位 (避免一筆事故多個當事人重複加權)
-        df_clean = df_clean.drop_duplicates(subset=[lat_col, lng_col])
+        # 關鍵修正 2：如果 drop_dups 為 False，就不執行 drop_duplicates！
+        if drop_dups:
+            df_clean = df_clean.drop_duplicates(subset=[lat_col, lng_col])
+            print(f"[{tag}] 執行重複點位清理，最終繪圖點數：{len(df_clean)}")
+        else:
+            print(f"[{tag}] 🚨 不執行去重，完整繪製所有 A1 事故點數：{len(df_clean)}")
 
-        print(f"[{tag}] 解析完成，最終繪圖點數：{len(df_clean)}")
         return df_clean[[lat_col, lng_col]].values.tolist()
 
     except Exception as e:
@@ -121,22 +124,22 @@ def fetch_data(url, tag="", filter_recent_months=False, is_json=False):
 # --- 地圖初始化 ---
 m = folium.Map(location=[23.973877, 120.982024], zoom_start=8, tiles="cartodbpositron", control_scale=True)
 
-# 1. A1 事故 (全抓，絕對不篩選時間)
-pts_a1 = fetch_data(URL_A1, "A1事故", filter_recent_months=False)
+# 1. A1 事故 (全抓、不篩選時間、不執行去重，保證全部呈現)
+pts_a1 = fetch_data(URL_A1, "A1事故", filter_recent_months=False, drop_dups=False)
 if pts_a1:
     fg1 = folium.FeatureGroup(name="🚨 A1 類重大交通事故 (全歷史資料)", show=True)
     HeatMap(pts_a1, radius=15, blur=10).add_to(fg1)
     fg1.add_to(m)
 
 # 2. A2 事故 (近3個月)
-pts_a2 = fetch_data(URL_A2, "A2事故", filter_recent_months=True)
+pts_a2 = fetch_data(URL_A2, "A2事故", filter_recent_months=True, drop_dups=True)
 if pts_a2:
     fg2 = folium.FeatureGroup(name="⚠️ A2 類交通事故 (近3個月)", show=False)
     HeatMap(pts_a2, radius=10, blur=8, gradient={0.4: 'cyan', 0.65: 'yellow', 1: 'orange'}).add_to(fg2)
     fg2.add_to(m)
 
 # 3. 山坡地警戒點
-pts_slope = fetch_data(URL_SLOPE, "山坡地警戒", filter_recent_months=False, is_json=True)
+pts_slope = fetch_data(URL_SLOPE, "山坡地警戒", filter_recent_months=False, drop_dups=True, is_json=True)
 if pts_slope:
     fg3 = folium.FeatureGroup(name="⛰️ 土石流及坡地災害警戒區", show=False)
     HeatMap(pts_slope, radius=18, blur=12, gradient={0.4: 'purple', 0.8: 'brown', 1: 'darkred'}).add_to(fg3)
@@ -204,4 +207,4 @@ m.get_root().html.add_child(folium.Element(real_geo_js))
 folium.LayerControl(collapsed=False).add_to(m)
 
 m.save("index.html")
-print("更新完成！A1 完全鎖定不篩選，點位即將全部繪製！")
+print("更新完成！已將 A1 去重關閉，全量繪製事故點！")
