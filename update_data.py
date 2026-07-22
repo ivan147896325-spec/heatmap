@@ -10,8 +10,8 @@ from datetime import datetime, timedelta
 # 1. 官方 API 網址
 URL_A1 = "https://opdadm.moi.gov.tw/api/v1/no-auth/resource/api/dataset/02D40248-7CAA-4354-82EA-E27AB8DCAB39/resource/7CE45778-7EF7-4B45-BD69-7BFB6868C0DB/download"
 URL_A2 = "https://opdadm.moi.gov.tw/api/v1/no-auth/resource/api/dataset/266D0D60-4966-4F2A-A80F-A8659ED511E9/resource/7743EB5B-6A59-4785-B4BA-6D29DEDF82CD/download"
-# 最新水保署土石流潛勢溪流 API 正確網址
-URL_SLOPE = "https://data.ardswc.gov.tw/api/v1/DebrisStream"
+# 水保署土石流潛勢溪流警告標誌/警戒 JSON 端點
+URL_SLOPE = "https://data.ardswc.gov.tw/api/v1/DebrisWarning"
 
 def fetch_data(url, tag="", filter_recent_months=False, drop_dups=True, is_json=False):
     try:
@@ -32,26 +32,30 @@ def fetch_data(url, tag="", filter_recent_months=False, drop_dups=True, is_json=
         else:
             content = res.content
 
-            # Zip 檔解壓處理
+            # Zip 檔解壓處理 (借鏡 Kiang 邏輯)
             if content[:4] == b'PK\x03\x04':
                 print(f"[{tag}] 進行 ZIP 解壓...")
                 with zipfile.ZipFile(io.BytesIO(content)) as z:
                     dfs = []
                     for info in z.infolist():
+                        # 檔名只取最後一截，避免目錄名稱干擾
                         filename_only = info.filename.split('/')[-1]
                         
-                        # 核心防護：非目錄 + 副檔名 .csv + 檔名必須包含 "NPA_"
-                        if not info.is_dir() and filename_only.lower().endswith('.csv') and 'NPA_' in filename_only:
+                        # 🔒 關鍵三重防護：
+                        # 1. 絕非資料夾 (!info.is_dir())
+                        # 2. 檔案大小大於 10 KB (排除 1KB 的 file.csv, manifest.csv, schema-file.csv)
+                        # 3. 檔名包含 NPA_ 且副檔名為 .csv
+                        if not info.is_dir() and info.file_size > 10 * 1024 and filename_only.lower().endswith('.csv') and 'NPA_' in filename_only:
                             try:
-                                print(f"[{tag}] 命中主資料檔: {filename_only} ({info.file_size / 1024:.1f} KB)")
+                                print(f"[{tag}] 成功抓取主資料檔: {filename_only} ({info.file_size / 1024:.1f} KB)")
                                 temp_df = pd.read_csv(z.open(info.filename), on_bad_lines='skip', encoding='utf-8-sig', dtype=str)
                                 if len(temp_df) > 0:
                                     dfs.append(temp_df)
                             except Exception as parse_err:
                                 print(f"[{tag}] ⚠️ 跳過異常子檔案 {info.filename}: {parse_err}")
                         else:
-                            if filename_only.lower().endswith('.csv'):
-                                print(f"[{tag}] 🙈 忽略中繼/雜訊檔: {filename_only}")
+                            if not info.is_dir() and filename_only.lower().endswith('.csv'):
+                                print(f"[{tag}] 🙈 忽略小於10KB的中繼/雜訊檔: {filename_only} ({info.file_size} Bytes)")
 
                     if dfs:
                         df = pd.concat(dfs, ignore_index=True)
@@ -86,7 +90,7 @@ def fetch_data(url, tag="", filter_recent_months=False, drop_dups=True, is_json=
             print(f"[{tag}] ❌ 找不到經緯度欄位")
             return None
 
-        # --- 時間過濾 (只在 filter_recent_months=True 時對大表合併結果執行) ---
+        # --- 時間過濾 ---
         if filter_recent_months is True and date_col is not None:
             now = datetime.now()
             cutoff_date = now - timedelta(days=90)
@@ -139,14 +143,14 @@ if pts_a1:
     HeatMap(pts_a1, radius=15, blur=10).add_to(fg1)
     fg1.add_to(m)
 
-# 2. A2 事故 (近3個月，精準以 NPA_ 篩選主檔合併後再過濾時間)
+# 2. A2 事故 (近3個月，加強容量過濾與 NPA_ 鎖定)
 pts_a2 = fetch_data(URL_A2, "A2事故", filter_recent_months=True, drop_dups=True)
 if pts_a2:
     fg2 = folium.FeatureGroup(name="⚠️ A2 類交通事故 (近3個月)", show=False)
     HeatMap(pts_a2, radius=10, blur=8, gradient={0.4: 'cyan', 0.65: 'yellow', 1: 'orange'}).add_to(fg2)
     fg2.add_to(m)
 
-# 3. 山坡地警戒點 (修正網址)
+# 3. 山坡地警戒點
 pts_slope = fetch_data(URL_SLOPE, "山坡地警戒", filter_recent_months=False, drop_dups=True, is_json=True)
 if pts_slope:
     fg3 = folium.FeatureGroup(name="⛰️ 土石流及坡地災害警戒區", show=False)
@@ -215,4 +219,4 @@ m.get_root().html.add_child(folium.Element(real_geo_js))
 folium.LayerControl(collapsed=False).add_to(m)
 
 m.save("index.html")
-print("更新完成！A2 已精準以 'NPA_' 進行篩選。")
+print("更新完成！")
