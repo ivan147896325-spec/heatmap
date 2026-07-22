@@ -9,16 +9,35 @@ from datetime import datetime, timedelta
 
 # 1. 官方 API 網址
 URL_A1 = "https://opdadm.moi.gov.tw/api/v1/no-auth/resource/api/dataset/02D40248-7CAA-4354-82EA-E27AB8DCAB39/resource/7CE45778-7EF7-4B45-BD69-7BFB6868C0DB/download"
-URL_A2 = "https://opdadm.moi.gov.tw/api/v1/no-auth/resource/api/dataset/266D0D60-4966-4F2A-A80F-A8659ED511E9/resource/7743EB5B-6A59-4785-B4BA-6D29DEDF82CD/download"
-# 最新水保署土石流潛勢溪流 API 正確端點
-URL_SLOPE = "https://data.ardswc.gov.tw/api/v1/DebrisStream"
+URL_A2_STATIC = "https://opdadm.moi.gov.tw/api/v1/no-auth/resource/api/dataset/266D0D60-4966-4F2A-A80F-A8659ED511E9/resource/7743EB5B-6A59-4785-B4BA-6D29DEDF82CD/download"
+
+# 農村水保署最新 API 端點
+URL_SLOPE = "https://data.ardswc.gov.tw/api/v1/DebrisWarning"
+
+def get_a2_dynamic_url():
+    """借鏡 Kiang 的作法：向 data.gov.tw API 動態查詢最新 A2 ZIP 下載網址"""
+    try:
+        print("[A2事故] 嘗試透過 data.gov.tw API 取得最新 ZIP 網址...")
+        api_url = "https://data.gov.tw/api/v2/rest/dataset/13139"
+        res = requests.get(api_url, timeout=15, verify=False)
+        if res.status_code == 200:
+            data = res.json()
+            for item in data.get('result', {}).get('distribution', []):
+                if item.get('resourceFormat') == 'ZIP':
+                    dl_url = item.get('resourceDownloadUrl')
+                    print(f"[A2事故] 成功獲取動態下載網址: {dl_url}")
+                    return dl_url
+    except Exception as e:
+        print(f"[A2事故] 動態查詢網址失敗: {e}")
+    return URL_A2_STATIC
 
 def fetch_data(url, tag="", filter_recent_months=False, drop_dups=True, is_json=False):
     try:
         print(f"\n==================== [{tag}] 開始下載資料 ====================")
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
         session = requests.Session()
-        res = session.get(url, headers=headers, timeout=60, verify=False, allow_redirects=True)
+        
+        res = session.get(url, headers=headers, timeout=90, verify=False, allow_redirects=True)
         res.raise_for_status()
 
         df = None
@@ -35,6 +54,10 @@ def fetch_data(url, tag="", filter_recent_months=False, drop_dups=True, is_json=
             content = res.content
             print(f"[{tag}] 下載完成，內容大小: {len(content) / 1024:.1f} KB")
 
+            if len(content) == 0:
+                print(f"[{tag}] ❌ 下載內容為 0 KB，停止處理")
+                return None
+
             # Zip 檔解壓處理
             if content[:4] == b'PK\x03\x04':
                 print(f"[{tag}] 偵測到 ZIP 格式，開始掃描內部檔案結構...")
@@ -42,38 +65,23 @@ def fetch_data(url, tag="", filter_recent_months=False, drop_dups=True, is_json=
                 with zipfile.ZipFile(io.BytesIO(content)) as z:
                     dfs = []
                     all_infos = z.infolist()
-                    print(f"[{tag}] ZIP 內共有 {len(all_infos)} 個項目 (含目錄與檔案):")
+                    print(f"[{tag}] ZIP 內共有 {len(all_infos)} 個項目:")
 
                     for idx, info in enumerate(all_infos, 1):
                         filename_only = info.filename.split('/')[-1].lower()
                         is_dir_flag = info.is_dir()
-                        
-                        # Print 每個項目的詳細特徵
-                        print(f"  [{idx}/{len(all_infos)}] 項目: '{info.filename}' | 目錄?: {is_dir_flag} | 大小: {info.file_size} Bytes")
 
-                        # 判斷是否為黑名單或無效項目
-                        if is_dir_flag:
-                            print(f"    └─ ❌ 跳過: 此項目為目錄/資料夾")
-                            continue
-                        if filename_only in meta_files:
-                            print(f"    └─ ❌ 跳過: 命中 metadata 黑名單 ({filename_only})")
-                            continue
-                        if not filename_only.endswith('.csv'):
-                            print(f"    └─ ❌ 跳過: 非 .csv 檔案")
-                            continue
-                        if info.file_size < 1000:  # 小於 1KB 視為無效檔
-                            print(f"    └─ ❌ 跳過: 容量過小 (< 1KB)")
+                        if is_dir_flag or filename_only in meta_files or not filename_only.endswith('.csv') or info.file_size < 1000:
                             continue
 
-                        # 嘗試讀取目標 CSV
                         try:
-                            print(f"    └─ 🟢 嘗試讀取 CSV 內容: {info.filename}...")
+                            print(f"    └─ 🟢 嘗試讀取 CSV 內容: {info.filename} ({info.file_size / 1024:.1f} KB)...")
                             temp_df = pd.read_csv(z.open(info.filename), on_bad_lines='skip', encoding='utf-8-sig', dtype=str)
-                            print(f"       成功讀取! 欄位清單: {list(temp_df.columns)} | 資料列數: {len(temp_df)}")
+                            print(f"       成功讀取! 欄位數: {len(temp_df.columns)} | 資料列數: {len(temp_df)}")
                             if len(temp_df) > 0:
                                 dfs.append(temp_df)
                         except Exception as parse_err:
-                            print(f"    └─ ⚠️ 讀取失敗 報錯內容: {parse_err}")
+                            print(f"    └─ ⚠️ 讀取失敗: {parse_err}")
 
                     if dfs:
                         df = pd.concat(dfs, ignore_index=True)
@@ -86,7 +94,7 @@ def fetch_data(url, tag="", filter_recent_months=False, drop_dups=True, is_json=
                     df = pd.read_csv(gz, on_bad_lines='skip', encoding='utf-8-sig', dtype=str)
 
             # 一般 CSV 讀取
-            if df is None:
+            if df is None and content[:4] != b'PK\x03\x04':
                 print(f"[{tag}] 嘗試作為單一 CSV 檔讀取...")
                 df = pd.read_csv(io.BytesIO(content), on_bad_lines='skip', encoding='utf-8-sig', dtype=str)
 
@@ -99,7 +107,6 @@ def fetch_data(url, tag="", filter_recent_months=False, drop_dups=True, is_json=
         lng_col = next((c for c in df.columns if str(c).strip() in ['經度', 'Lng', 'lng', 'Lon', 'lon', 'X', 'x']), None)
         date_col = next((c for c in df.columns if str(c).strip() in ['發生日期', '日期', 'Date']), None)
 
-        # 備援模糊搜尋
         if not lat_col: lat_col = next((c for c in df.columns if any(k in str(c) for k in ['緯', 'lat', 'Y'])), None)
         if not lng_col: lng_col = next((c for c in df.columns if any(k in str(c) for k in ['經', 'lng', 'lon', 'X'])), None)
         if not date_col: date_col = next((c for c in df.columns if '日' in str(c)), None)
@@ -107,7 +114,7 @@ def fetch_data(url, tag="", filter_recent_months=False, drop_dups=True, is_json=
         print(f"[{tag}] 欄位對應 -> 緯度: [{lat_col}], 經度: [{lng_col}], 日期: [{date_col}]")
 
         if not lat_col or not lng_col:
-            print(f"[{tag}] ❌ 找不到經緯度欄位！無法繪圖")
+            print(f"[{tag}] ❌ 找不到經緯度欄位")
             return None
 
         # --- 時間過濾 ---
@@ -126,11 +133,10 @@ def fetch_data(url, tag="", filter_recent_months=False, drop_dups=True, is_json=
 
             df['parsed_dt'] = df[date_col].apply(parse_8digit_date)
             valid_cnt = df['parsed_dt'].notnull().sum()
-            print(f"[{tag}] 日期欄位成功解析比例: {valid_cnt} / {len(df)} 筆")
 
             if valid_cnt > 0:
                 df = df[df['parsed_dt'] >= cutoff_date]
-                print(f"[{tag}] 進行 90 天時間篩選 ({cutoff_date.strftime('%Y-%m-%d')} 至今)，剩餘 {len(df)} 筆")
+                print(f"[{tag}] 進行 90 天時間篩選，剩餘 {len(df)} 筆")
         else:
             print(f"[{tag}] 🔒 不進行時間篩選，保留全量資料")
 
@@ -157,15 +163,16 @@ def fetch_data(url, tag="", filter_recent_months=False, drop_dups=True, is_json=
 # --- 地圖初始化 ---
 m = folium.Map(location=[23.973877, 120.982024], zoom_start=8, tiles="cartodbpositron", control_scale=True)
 
-# 🔒 1. A1 事故 (鎖定：全抓、不篩選時間、不執行去重)
+# 🔒 1. A1 事故 (全量鎖定)
 pts_a1 = fetch_data(URL_A1, "A1事故", filter_recent_months=False, drop_dups=False)
 if pts_a1:
     fg1 = folium.FeatureGroup(name="🚨 A1 類重大交通事故 (全歷史資料)", show=True)
     HeatMap(pts_a1, radius=15, blur=10).add_to(fg1)
     fg1.add_to(m)
 
-# 2. A2 事故 (近3個月，加強偵錯輸出的解壓邏輯)
-pts_a2 = fetch_data(URL_A2, "A2事故", filter_recent_months=True, drop_dups=True)
+# 2. A2 事故 (使用動態 API 獲取下載連結，近3個月)
+url_a2_target = get_a2_dynamic_url()
+pts_a2 = fetch_data(url_a2_target, "A2事故", filter_recent_months=True, drop_dups=True)
 if pts_a2:
     fg2 = folium.FeatureGroup(name="⚠️ A2 類交通事故 (近3個月)", show=False)
     HeatMap(pts_a2, radius=10, blur=8, gradient={0.4: 'cyan', 0.65: 'yellow', 1: 'orange'}).add_to(fg2)
