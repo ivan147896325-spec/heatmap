@@ -10,9 +10,9 @@ from datetime import datetime, timedelta
 # 1. 官方 API 網址
 URL_A1 = "https://opdadm.moi.gov.tw/api/v1/no-auth/resource/api/dataset/02D40248-7CAA-4354-82EA-E27AB8DCAB39/resource/7CE45778-7EF7-4B45-BD69-7BFB6868C0DB/download"
 URL_A2 = "https://opdadm.moi.gov.tw/api/v1/no-auth/resource/api/dataset/266D0D60-4966-4F2A-A80F-A8659ED511E9/resource/7743EB5B-6A59-4785-B4BA-6D29DEDF82CD/download"
-URL_SLOPE = "https://data.ardswc.gov.tw/api/v1/DebrisWarning"
+URL_SLOPE = "https://data.moi.gov.tw/MoiOD/System/DownloadFile.aspx?DATA=B75BA704-B091-4D2A-B980-EB141C44F35E"
 
-def fetch_data(url, tag="", filter_recent_months=False, is_json=False):
+def fetch_data(url, tag="", filter_recent_months=False):
     try:
         print(f"[{tag}] 開始下載資料...")
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
@@ -21,34 +21,35 @@ def fetch_data(url, tag="", filter_recent_months=False, is_json=False):
         res.raise_for_status()
 
         df = None
+        content = res.content
 
-        if is_json:
-            data = res.json()
-            df = pd.DataFrame(data['data'] if isinstance(data, dict) and 'data' in data else data)
-        else:
-            content = res.content
-            if content[:4] == b'PK\x03\x04':
-                print(f"[{tag}] 進行 ZIP 解壓...")
-                with zipfile.ZipFile(io.BytesIO(content)) as z:
-                    npa_files = [f for f in z.namelist() if f.upper().startswith('NPA') and f.lower().endswith('.csv')]
-                    if npa_files:
-                        dfs = []
-                        for f in npa_files:
-                            print(f"[{tag}] 載入主檔: {f}")
-                            dfs.append(pd.read_csv(z.open(f), on_bad_lines='skip', encoding='utf-8-sig', dtype=str))
-                        df = pd.concat(dfs, ignore_index=True)
-                    else:
-                        main_files = [f for f in z.namelist() if f.lower().endswith('.csv') and z.getinfo(f).file_size > 100 * 1024]
-                        if main_files:
-                            dfs = [pd.read_csv(z.open(f), on_bad_lines='skip', encoding='utf-8-sig', dtype=str) for f in main_files]
-                            df = pd.concat(dfs, ignore_index=True)
+        # 1. Zip 檔解壓 (過濾小於 10KB 的說明/Schema檔，保護大於 10KB 的實體資料)
+        if content[:4] == b'PK\x03\x04':
+            print(f"[{tag}] 進行 ZIP 解壓...")
+            with zipfile.ZipFile(io.BytesIO(content)) as z:
+                # 只讀取副檔名為 .csv 且大小大於 10 KB 的實體資料檔
+                data_csv_infos = [
+                    info for info in z.infolist() 
+                    if info.filename.lower().endswith('.csv') and info.file_size > 10 * 1024
+                ]
+                
+                if data_csv_infos:
+                    dfs = []
+                    for info in data_csv_infos:
+                        print(f"[{tag}] 鎖定資料主檔: {info.filename} (大小: {info.file_size / 1024:.1f} KB)")
+                        dfs.append(pd.read_csv(z.open(info.filename), on_bad_lines='skip', encoding='utf-8-sig', dtype=str))
+                    df = pd.concat(dfs, ignore_index=True)
+                else:
+                    print(f"[{tag}] ⚠️ 未能在 ZIP 內找到大於 10KB 的資料 CSV")
 
-            if df is None and content[:2] == b'\x1f\x8b':
-                with gzip.GzipFile(fileobj=io.BytesIO(content)) as gz:
-                    df = pd.read_csv(gz, on_bad_lines='skip', encoding='utf-8-sig', dtype=str)
+        # 2. Gzip 檔解壓
+        if df is None and content[:2] == b'\x1f\x8b':
+            with gzip.GzipFile(fileobj=io.BytesIO(content)) as gz:
+                df = pd.read_csv(gz, on_bad_lines='skip', encoding='utf-8-sig', dtype=str)
 
-            if df is None:
-                df = pd.read_csv(io.BytesIO(content), on_bad_lines='skip', encoding='utf-8-sig', dtype=str)
+        # 3. 一般 CSV 讀取
+        if df is None:
+            df = pd.read_csv(io.BytesIO(content), on_bad_lines='skip', encoding='utf-8-sig', dtype=str)
 
         if df is None or len(df) == 0:
             print(f"[{tag}] ⚠️ 資料讀取為空")
@@ -56,12 +57,12 @@ def fetch_data(url, tag="", filter_recent_months=False, is_json=False):
 
         print(f"[{tag}] 成功讀取 {len(df)} 筆原始資料")
 
-        # 精準鎖定截圖中的欄位名稱
+        # 精準鎖定欄位名稱
         lat_col = next((c for c in df.columns if str(c).strip() == '緯度'), None)
         lng_col = next((c for c in df.columns if str(c).strip() == '經度'), None)
         date_col = next((c for c in df.columns if str(c).strip() == '發生日期'), None)
 
-        # 備援搜尋
+        # 備援模糊搜尋
         if not lat_col: lat_col = next((c for c in df.columns if '緯' in str(c)), None)
         if not lng_col: lng_col = next((c for c in df.columns if '經' in str(c)), None)
         if not date_col: date_col = next((c for c in df.columns if '日' in str(c)), None)
@@ -72,7 +73,7 @@ def fetch_data(url, tag="", filter_recent_months=False, is_json=False):
             print(f"[{tag}] ❌ 找不到經緯度欄位")
             return None
 
-        # --- 近 3 個月時間過濾 (專攻 20260301 格式) ---
+        # --- 近 3 個月時間過濾 (對應 20260301 格式) ---
         if filter_recent_months and date_col:
             now = datetime.now()
             cutoff_date = now - timedelta(days=90)
@@ -94,7 +95,7 @@ def fetch_data(url, tag="", filter_recent_months=False, is_json=False):
                 df = df[df['parsed_dt'] >= cutoff_date]
                 print(f"[{tag}] 篩選 {cutoff_date.strftime('%Y-%m-%d')} 至今，剩餘 {len(df)} 筆")
 
-        # 轉數字與清潔
+        # 轉數字與座標區域清潔
         df[lat_col] = pd.to_numeric(df[lat_col], errors='coerce')
         df[lng_col] = pd.to_numeric(df[lng_col], errors='coerce')
 
@@ -102,7 +103,7 @@ def fetch_data(url, tag="", filter_recent_months=False, is_json=False):
         df_clean = df_clean[(df_clean[lat_col] > 21) & (df_clean[lat_col] < 26) & 
                             (df_clean[lng_col] > 119) & (df_clean[lng_col] < 123)]
 
-        # 移除重複點位（防止多個當事人重複計算熱點）
+        # 移除重複點位 (避免一筆事故多個當事人重複加權)
         df_clean = df_clean.drop_duplicates(subset=[lat_col, lng_col])
 
         print(f"[{tag}] 解析完成，最終繪圖點數：{len(df_clean)}")
@@ -115,14 +116,14 @@ def fetch_data(url, tag="", filter_recent_months=False, is_json=False):
 # --- 地圖初始化 ---
 m = folium.Map(location=[23.973877, 120.982024], zoom_start=8, tiles="cartodbpositron", control_scale=True)
 
-# 1. A1 事故
+# 1. A1 事故 (近3個月)
 pts_a1 = fetch_data(URL_A1, "A1事故", filter_recent_months=True)
 if pts_a1:
     fg1 = folium.FeatureGroup(name="🚨 A1 類重大交通事故 (近3個月)", show=True)
     HeatMap(pts_a1, radius=15, blur=10).add_to(fg1)
     fg1.add_to(m)
 
-# 2. A2 事故
+# 2. A2 事故 (近3個月)
 pts_a2 = fetch_data(URL_A2, "A2事故", filter_recent_months=True)
 if pts_a2:
     fg2 = folium.FeatureGroup(name="⚠️ A2 類交通事故 (近3個月)", show=False)
@@ -130,7 +131,7 @@ if pts_a2:
     fg2.add_to(m)
 
 # 3. 山坡地警戒點
-pts_slope = fetch_data(URL_SLOPE, "山坡地警戒", filter_recent_months=False, is_json=True)
+pts_slope = fetch_data(URL_SLOPE, "山坡地警戒", filter_recent_months=False)
 if pts_slope:
     fg3 = folium.FeatureGroup(name="⛰️ 土石流及坡地災害警戒區", show=False)
     HeatMap(pts_slope, radius=18, blur=12, gradient={0.4: 'purple', 0.8: 'brown', 1: 'darkred'}).add_to(fg3)
@@ -198,4 +199,4 @@ m.get_root().html.add_child(folium.Element(real_geo_js))
 folium.LayerControl(collapsed=False).add_to(m)
 
 m.save("index.html")
-print("針對正確欄位架構優化完畢！")
+print("整份 update_data.py 已順利更新完成！")
