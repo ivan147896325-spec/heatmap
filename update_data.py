@@ -11,13 +11,14 @@ from datetime import datetime, timedelta
 URL_A1 = "https://opdadm.moi.gov.tw/api/v1/no-auth/resource/api/dataset/02D40248-7CAA-4354-82EA-E27AB8DCAB39/resource/7CE45778-7EF7-4B45-BD69-7BFB6868C0DB/download"
 URL_A2_STATIC = "https://opdadm.moi.gov.tw/api/v1/no-auth/resource/api/dataset/266D0D60-4966-4F2A-A80F-A8659ED511E9/resource/7743EB5B-6A59-4785-B4BA-6D29DEDF82CD/download"
 
-# 農村水保署最新 API 端點
+# 農村水保署 API 網址 (修正為官方 DebrisWarning 端點)
 URL_SLOPE = "https://data.ardswc.gov.tw/api/v1/DebrisWarning"
 
-def get_a2_dynamic_url():
-    """借鏡 Kiang 的作法：向 data.gov.tw API 動態查詢最新 A2 ZIP 下載網址"""
+def get_a2_all_zip_urls():
+    """動態抓取 data.gov.tw 上所有 A2 的 ZIP 資源網址清單，確保不漏掉任何一個 ZIP"""
+    urls = []
     try:
-        print("[A2事故] 嘗試透過 data.gov.tw API 取得最新 ZIP 網址...")
+        print("[A2事故] 嘗試透過 data.gov.tw API 查詢所有 ZIP 下載網址...")
         api_url = "https://data.gov.tw/api/v2/rest/dataset/13139"
         res = requests.get(api_url, timeout=15, verify=False)
         if res.status_code == 200:
@@ -25,82 +26,78 @@ def get_a2_dynamic_url():
             for item in data.get('result', {}).get('distribution', []):
                 if item.get('resourceFormat') == 'ZIP':
                     dl_url = item.get('resourceDownloadUrl')
-                    print(f"[A2事故] 成功獲取動態下載網址: {dl_url}")
-                    return dl_url
+                    if dl_url and dl_url not in urls:
+                        urls.append(dl_url)
+            print(f"[A2事故] 成功找到 {len(urls)} 個 ZIP 資料集網址！")
     except Exception as e:
         print(f"[A2事故] 動態查詢網址失敗: {e}")
-    return URL_A2_STATIC
+    
+    if not urls:
+        urls = [URL_A2_STATIC]
+    return urls
 
-def fetch_data(url, tag="", filter_recent_months=False, drop_dups=True, is_json=False):
+def fetch_data(urls, tag="", filter_recent_months=False, drop_dups=True, is_json=False):
     try:
-        print(f"\n==================== [{tag}] 開始下載資料 ====================")
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-        session = requests.Session()
-        
-        res = session.get(url, headers=headers, timeout=90, verify=False, allow_redirects=True)
-        res.raise_for_status()
+        if isinstance(urls, str):
+            urls = [urls]
 
-        df = None
+        all_dfs = []
 
-        if is_json:
-            print(f"[{tag}] 正在解析 JSON 資料...")
-            data = res.json()
-            if isinstance(data, dict) and 'data' in data:
-                df = pd.DataFrame(data['data'])
-            elif isinstance(data, list):
-                df = pd.DataFrame(data)
-            print(f"[{tag}] JSON 載入完成，取得 {len(df) if df is not None else 0} 筆列資料")
-        else:
-            content = res.content
-            print(f"[{tag}] 下載完成，內容大小: {len(content) / 1024:.1f} KB")
+        for u_idx, url in enumerate(urls, 1):
+            print(f"\n==================== [{tag}] 開始下載資料 ({u_idx}/{len(urls)}) ====================")
+            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+            session = requests.Session()
+            
+            res = session.get(url, headers=headers, timeout=90, verify=False, allow_redirects=True)
+            res.raise_for_status()
 
-            if len(content) == 0:
-                print(f"[{tag}] ❌ 下載內容為 0 KB，停止處理")
-                return None
+            if is_json:
+                print(f"[{tag}] 正在解析 JSON 資料...")
+                data = res.json()
+                if isinstance(data, dict) and 'data' in data:
+                    all_dfs.append(pd.DataFrame(data['data']))
+                elif isinstance(data, list):
+                    all_dfs.append(pd.DataFrame(data))
+            else:
+                content = res.content
+                print(f"[{tag}] 下載完成，內容大小: {len(content) / 1024:.1f} KB")
 
-            # Zip 檔解壓處理
-            if content[:4] == b'PK\x03\x04':
-                print(f"[{tag}] 偵測到 ZIP 格式，開始掃描內部檔案結構...")
-                meta_files = ['file.csv', 'manifest.csv', 'schema-file.csv']
-                with zipfile.ZipFile(io.BytesIO(content)) as z:
-                    dfs = []
-                    all_infos = z.infolist()
-                    print(f"[{tag}] ZIP 內共有 {len(all_infos)} 個項目:")
+                if len(content) == 0:
+                    continue
 
-                    for idx, info in enumerate(all_infos, 1):
-                        filename_only = info.filename.split('/')[-1].lower()
-                        is_dir_flag = info.is_dir()
+                # Zip 檔解壓處理
+                if content[:4] == b'PK\x03\x04':
+                    print(f"[{tag}] 偵測到 ZIP 格式，掃描內部檔案...")
+                    meta_files = ['file.csv', 'manifest.csv', 'schema-file.csv']
+                    with zipfile.ZipFile(io.BytesIO(content)) as z:
+                        for info in z.infolist():
+                            filename_only = info.filename.split('/')[-1].lower()
+                            if info.is_dir() or filename_only in meta_files or not filename_only.endswith('.csv') or info.file_size < 1000:
+                                continue
 
-                        if is_dir_flag or filename_only in meta_files or not filename_only.endswith('.csv') or info.file_size < 1000:
-                            continue
+                            try:
+                                print(f"    └─ 🟢 讀取 CSV: {info.filename} ({info.file_size / 1024:.1f} KB)...")
+                                temp_df = pd.read_csv(z.open(info.filename), on_bad_lines='skip', encoding='utf-8-sig', dtype=str)
+                                if len(temp_df) > 0:
+                                    all_dfs.append(temp_df)
+                            except Exception as parse_err:
+                                print(f"    └─ ⚠️ 讀取失敗: {parse_err}")
 
-                        try:
-                            print(f"    └─ 🟢 嘗試讀取 CSV 內容: {info.filename} ({info.file_size / 1024:.1f} KB)...")
-                            temp_df = pd.read_csv(z.open(info.filename), on_bad_lines='skip', encoding='utf-8-sig', dtype=str)
-                            print(f"       成功讀取! 欄位數: {len(temp_df.columns)} | 資料列數: {len(temp_df)}")
-                            if len(temp_df) > 0:
-                                dfs.append(temp_df)
-                        except Exception as parse_err:
-                            print(f"    └─ ⚠️ 讀取失敗: {parse_err}")
+                # Gzip 檔解壓
+                elif content[:2] == b'\x1f\x8b':
+                    with gzip.GzipFile(fileobj=io.BytesIO(content)) as gz:
+                        all_dfs.append(pd.read_csv(gz, on_bad_lines='skip', encoding='utf-8-sig', dtype=str))
 
-                    if dfs:
-                        df = pd.concat(dfs, ignore_index=True)
-                        print(f"[{tag}] 成功併檔 {len(dfs)} 個有效資料集，總計 {len(df)} 筆原始列資料")
+                # 一般 CSV 讀取
+                else:
+                    all_dfs.append(pd.read_csv(io.BytesIO(content), on_bad_lines='skip', encoding='utf-8-sig', dtype=str))
 
-            # Gzip 檔解壓
-            if df is None and content[:2] == b'\x1f\x8b':
-                print(f"[{tag}] 偵測到 GZIP 格式，開始解壓...")
-                with gzip.GzipFile(fileobj=io.BytesIO(content)) as gz:
-                    df = pd.read_csv(gz, on_bad_lines='skip', encoding='utf-8-sig', dtype=str)
-
-            # 一般 CSV 讀取
-            if df is None and content[:4] != b'PK\x03\x04':
-                print(f"[{tag}] 嘗試作為單一 CSV 檔讀取...")
-                df = pd.read_csv(io.BytesIO(content), on_bad_lines='skip', encoding='utf-8-sig', dtype=str)
-
-        if df is None or len(df) == 0:
-            print(f"[{tag}] ⚠️ 最終 DataFrame 為空")
+        if not all_dfs:
+            print(f"[{tag}] ⚠️ 未能成功載入任何資料集")
             return None
+
+        df = pd.concat(all_dfs, ignore_index=True)
+        print(f"[{tag}] 成功合併所有數據，總筆數：{len(df)}")
 
         # 精準鎖定欄位名稱
         lat_col = next((c for c in df.columns if str(c).strip() in ['緯度', 'Lat', 'lat', 'Y', 'y']), None)
@@ -117,22 +114,24 @@ def fetch_data(url, tag="", filter_recent_months=False, drop_dups=True, is_json=
             print(f"[{tag}] ❌ 找不到經緯度欄位")
             return None
 
-        # --- 時間過濾 ---
+        # --- 純西元年時間過濾 (嚴格以西元年 YYYYMMDD 格式解析) ---
         if filter_recent_months is True and date_col is not None:
             now = datetime.now()
             cutoff_date = now - timedelta(days=90)
             
-            def parse_8digit_date(val):
+            def parse_pure_iso_date(val):
                 try:
-                    s = str(val).strip()
-                    if len(s) >= 8:
+                    s = str(val).strip().replace('-', '').replace('/', '')
+                    # 只接受標準西元年 8 位數格式 (例如: 20260315)
+                    if len(s) == 8 and s.startswith(('202', '201', '199', '198')):
                         return datetime(int(s[:4]), int(s[4:6]), int(s[6:8]))
                 except:
                     return None
                 return None
 
-            df['parsed_dt'] = df[date_col].apply(parse_8digit_date)
+            df['parsed_dt'] = df[date_col].apply(parse_pure_iso_date)
             valid_cnt = df['parsed_dt'].notnull().sum()
+            print(f"[{tag}] 西元年日期成功解析筆數: {valid_cnt} / {len(df)}")
 
             if valid_cnt > 0:
                 df = df[df['parsed_dt'] >= cutoff_date]
@@ -170,9 +169,9 @@ if pts_a1:
     HeatMap(pts_a1, radius=15, blur=10).add_to(fg1)
     fg1.add_to(m)
 
-# 2. A2 事故 (使用動態 API 獲取下載連結，近3個月)
-url_a2_target = get_a2_dynamic_url()
-pts_a2 = fetch_data(url_a2_target, "A2事故", filter_recent_months=True, drop_dups=True)
+# 2. A2 事故 (抓取所有 ZIP 檔 + 純西元年時間篩選)
+urls_a2 = get_a2_all_zip_urls()
+pts_a2 = fetch_data(urls_a2, "A2事故", filter_recent_months=True, drop_dups=True)
 if pts_a2:
     fg2 = folium.FeatureGroup(name="⚠️ A2 類交通事故 (近3個月)", show=False)
     HeatMap(pts_a2, radius=10, blur=8, gradient={0.4: 'cyan', 0.65: 'yellow', 1: 'orange'}).add_to(fg2)
